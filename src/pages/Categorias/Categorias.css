@@ -1,0 +1,121 @@
+/* Contenedor para limitar ancho y centrar bonito */
+.categorias-wrap {
+  width: 100%;
+  max-width: 1200px;
+}
+
+/* Altura del bloque de categorías */
+.categorias-container {
+  display: flex;
+  height: 42vh;
+  min-height: 280px;
+  width: 100%;
+  overflow: hidden;
+  border-radius: 18px;
+}
+
+/* Panel base */
+.panel {
+  flex: 1;
+  position: relative;
+  overflow: hidden;
+  cursor: pointer;
+
+  /* ✅ imagen bien adaptada */
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+
+  /* ✅ animación suave */
+  transition: flex 650ms cubic-bezier(0.65, 0, 0.35, 1), transform 350ms ease, box-shadow 450ms ease;
+
+  /* ✅ separador sutil entre paneles */
+  border-right: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+/* Quitar separador al último */
+.panel:last-child {
+  border-right: none;
+}
+
+/* Hover expansión + elevación */
+.panel:hover {
+  flex: 3;
+  z-index: 10;
+
+  /* sensación de elevación */
+  transform: translateX(4px);
+
+  /* ✅ sombra hacia la IZQUIERDA */
+  box-shadow: -28px 0 55px rgba(0, 0, 0, 0.45);
+}
+
+/* Overlay para legibilidad */
+.panel-overlay {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    to top,
+    rgba(0, 0, 0, 0.68) 0%,
+    rgba(0, 0, 0, 0.30) 45%,
+    rgba(0, 0, 0, 0.18) 100%
+  );
+  transition: opacity 450ms ease;
+  opacity: 0.90;
+}
+
+.panel:hover .panel-overlay {
+  opacity: 0.70;
+}
+
+/* Texto */
+.panel-content {
+  position: absolute;
+  left: 22px;
+  bottom: 18px;
+  z-index: 2;
+}
+
+.panel-title {
+  margin: 0;
+  color: white;
+  font-size: 26px;
+  font-weight: 900;
+  letter-spacing: 1px;
+  text-shadow: 0 10px 25px rgba(0, 0, 0, 0.45);
+  transition: transform 450ms ease, font-size 450ms ease;
+}
+
+.panel:hover .panel-title {
+  transform: translateY(-2px);
+  font-size: 40px;
+}
+
+/* Responsive: en móvil mejor vertical y sin hover */
+@media (max-width: 900px) {
+  .categorias-container {
+    flex-direction: column;
+    height: auto;
+    min-height: 0;
+  }
+
+  .panel {
+    height: 180px;
+    border-right: none;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+  }
+
+  .panel:last-child {
+    border-bottom: none;
+  }
+
+  .panel:hover {
+    flex: 1;
+    transform: none;
+    box-shadow: none;
+  }
+
+  .panel-title {
+    font-size: 28px;
+  }
+}
