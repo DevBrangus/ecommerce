@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import { IoMdClose } from "react-icons/io";
 import { ProductCard } from "../../Components/ProductCard";
 import { ModalDetalleProducto } from "./ModalDetalleProducto";
-
+import { toast } from "react-toastify";
 const PRIMARY = "#c43728";
 const BASE_IMG = "https://carnesbrangus.com/tiendaBrangus";
 
@@ -25,7 +25,50 @@ const resolveImg = (raw) => {
     return u;
 };
 
-export const VistaProductos = ({ q = "", idCategoria = null, reloadKey = 0, topbarH = 0 }) => {
+// ===============================
+// THUMB CLIENT-SIDE (reduce jank)
+// ===============================
+const MAX_THUMB_W = 700; // 450-700 recomendado
+const THUMB_QUALITY = 0.78;
+
+const waitIdle = () =>
+    new Promise((resolve) => {
+        if (typeof window !== "undefined" && "requestIdleCallback" in window) {
+            window.requestIdleCallback(() => resolve(), { timeout: 800 });
+        } else {
+            setTimeout(resolve, 30);
+        }
+    });
+
+const blobToThumbUrl = async (blob) => {
+    const bmp = await createImageBitmap(blob);
+
+    const srcW = bmp.width;
+    const srcH = bmp.height;
+
+    const scale = Math.min(1, MAX_THUMB_W / Math.max(1, srcW));
+    const dstW = Math.max(1, Math.round(srcW * scale));
+    const dstH = Math.max(1, Math.round(srcH * scale));
+
+    const canvas = document.createElement("canvas");
+    canvas.width = dstW;
+    canvas.height = dstH;
+
+    const ctx = canvas.getContext("2d", { alpha: false, desynchronized: true });
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = "high";
+    ctx.drawImage(bmp, 0, 0, dstW, dstH);
+
+    bmp.close?.();
+
+    const thumbBlob = await new Promise((resolve) => {
+        canvas.toBlob((b) => resolve(b || blob), "image/webp", THUMB_QUALITY);
+    });
+
+    return URL.createObjectURL(thumbBlob);
+};
+
+export const VistaProductos = ({ q = "", idCategoria = null, reloadKey = 0, topbarH = 0, setPagina = () => { } }) => {
     const [openFilter, setOpenFilter] = useState(false);
     const [openSort, setOpenSort] = useState(false);
     const [tab, setTab] = useState("brand");
@@ -46,72 +89,99 @@ export const VistaProductos = ({ q = "", idCategoria = null, reloadKey = 0, topb
 
     const abortRef = useRef(null);
 
-    // ✅ Cache de imágenes (blob url) por id
+    // ===============================
+    // Cache en memoria (blob thumbs)
+    // ===============================
     const imagenesCache = useRef(new Map()); // id -> { url, ts }
     const imagenesPendientes = useRef(new Map()); // id -> Promise<string>
-    const urlsActuales = useRef(new Set()); // blob urls en uso (para limpiar)
 
-    const MAX_CACHE = 250;
+    const MAX_CACHE = 220;
+    const TTL_MS = 1000 * 60 * 40;
 
-    const limpiarBlobUrlsEnUso = useCallback(() => {
-        for (const url of urlsActuales.current) {
-            try { URL.revokeObjectURL(url); } catch { }
+    // Concurrencia de creación de thumbs (evita tirones)
+    const inflight = useRef(0);
+    const MAX_CONCURRENCY = 2;
+
+    const waitSlot = async () => {
+        while (inflight.current >= MAX_CONCURRENCY) {
+            await new Promise((r) => setTimeout(r, 50));
         }
-        urlsActuales.current.clear();
-    }, []);
+    };
 
     useEffect(() => {
         return () => {
-            // limpiar todo al desmontar
-            limpiarBlobUrlsEnUso();
             for (const [, item] of imagenesCache.current.entries()) {
                 if (item?.url) {
-                    try { URL.revokeObjectURL(item.url); } catch { }
+                    try {
+                        URL.revokeObjectURL(item.url);
+                    } catch { }
                 }
             }
             imagenesCache.current.clear();
             imagenesPendientes.current.clear();
         };
-    }, [limpiarBlobUrlsEnUso]);
+    }, []);
 
-    const obtenerImagenCacheada = useCallback(async ({ id, urlRemota }) => {
-        const key = String(id ?? "").trim();
-        if (!key || !urlRemota) return "";
+    const getImg = useCallback(async (prod) => {
+        const id = String(prod?.id ?? "").trim();
+        const urlRemota = String(prod?.urlRemota ?? "").trim();
+        if (!id || !urlRemota) return FALLBACK_IMG;
 
-        const hit = imagenesCache.current.get(key);
-        if (hit?.url) return hit.url;
+        const hit = imagenesCache.current.get(id);
+        if (hit?.url) {
+            if (!TTL_MS || Date.now() - (hit.ts || 0) < TTL_MS) return hit.url;
+            try {
+                URL.revokeObjectURL(hit.url);
+            } catch { }
+            imagenesCache.current.delete(id);
+        }
 
-        const pending = imagenesPendientes.current.get(key);
+        const pending = imagenesPendientes.current.get(id);
         if (pending) return pending;
 
         const p = (async () => {
-            const res = await fetch(urlRemota, { cache: "no-store" }); // server manda no-store igual, pero aquí lo convertimos en blob local
-            if (!res.ok) throw new Error("No se pudo descargar la imagen");
-            const blob = await res.blob();
-            const blobUrl = URL.createObjectURL(blob);
+            await waitSlot();
+            inflight.current += 1;
 
-            imagenesCache.current.set(key, { url: blobUrl, ts: Date.now() });
+            try {
+                // ✅ evita pelear con el scroll
+                await waitIdle();
 
-            // limitar cache
-            if (imagenesCache.current.size > MAX_CACHE) {
-                const firstKey = imagenesCache.current.keys().next().value;
-                const first = imagenesCache.current.get(firstKey);
-                if (first?.url) {
-                    try { URL.revokeObjectURL(first.url); } catch { }
+                const res = await fetch(urlRemota, { cache: "no-store" });
+                if (!res.ok) return FALLBACK_IMG;
+
+                const blob = await res.blob();
+
+                // ✅ clave: miniatura
+                const thumbUrl = await blobToThumbUrl(blob);
+
+                imagenesCache.current.set(id, { url: thumbUrl, ts: Date.now() });
+
+                if (imagenesCache.current.size > MAX_CACHE) {
+                    const firstKey = imagenesCache.current.keys().next().value;
+                    const first = imagenesCache.current.get(firstKey);
+                    if (first?.url) {
+                        try {
+                            URL.revokeObjectURL(first.url);
+                        } catch { }
+                    }
+                    imagenesCache.current.delete(firstKey);
                 }
-                imagenesCache.current.delete(firstKey);
-            }
 
-            return blobUrl;
+                return thumbUrl;
+            } catch {
+                return FALLBACK_IMG;
+            } finally {
+                inflight.current = Math.max(0, inflight.current - 1);
+            }
         })();
 
-        imagenesPendientes.current.set(key, p);
+        imagenesPendientes.current.set(id, p);
 
         try {
-            const blobUrl = await p;
-            return blobUrl;
+            return await p;
         } finally {
-            imagenesPendientes.current.delete(key);
+            imagenesPendientes.current.delete(id);
         }
     }, []);
 
@@ -148,7 +218,6 @@ export const VistaProductos = ({ q = "", idCategoria = null, reloadKey = 0, topb
             categoria: p?.categoria,
             presentacion: p?.presentacion,
             preparacion: p?.preparacion,
-            img: "", // se setea luego (blob)
             urlRemota,
             rating: Number(p?.rating || 5),
             reviews: Number(p?.reviews || 0),
@@ -230,50 +299,6 @@ export const VistaProductos = ({ q = "", idCategoria = null, reloadKey = 0, topb
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [page]);
 
-    // ✅ Cuando cambia la lista (o llega nueva página), descarga imágenes en background y asigna blob URL
-    useEffect(() => {
-        let alive = true;
-
-        const run = async () => {
-            const list = Array.isArray(productos) ? productos : [];
-            if (!list.length) return;
-
-            // limpiar blob urls anteriores en uso SOLO cuando no es append? (acá simplificamos: se mantiene cache global, pero liberamos urls usadas por el estado anterior)
-            limpiarBlobUrlsEnUso();
-
-            const updates = await Promise.all(
-                list.map(async (prod) => {
-                    const urlRemota = prod?.urlRemota;
-                    if (!urlRemota) return { id: prod.id, img: "" };
-
-                    try {
-                        const blobUrl = await obtenerImagenCacheada({ id: prod.id, urlRemota });
-                        return { id: prod.id, img: blobUrl };
-                    } catch {
-                        return { id: prod.id, img: "" };
-                    }
-                })
-            );
-
-            if (!alive) return;
-
-            setProductos((prev) => {
-                const map = new Map(updates.map((u) => [u.id, u.img]));
-                const next = prev.map((p) => {
-                    const img = map.get(p.id) || "";
-                    if (img) urlsActuales.current.add(img);
-                    return { ...p, img: img || FALLBACK_IMG };
-                });
-                return next;
-            });
-        };
-
-        run();
-        return () => {
-            alive = false;
-        };
-    }, [productos.length, obtenerImagenCacheada, limpiarBlobUrlsEnUso]);
-
     const closeAllPopups = useCallback(() => {
         setOpenSort(false);
         setOpenFilter(false);
@@ -302,8 +327,7 @@ export const VistaProductos = ({ q = "", idCategoria = null, reloadKey = 0, topb
     const getPrecioFinal = useCallback((prod) => {
         const valor = Number(prod?.valor || 0);
         const desc = Number(prod?.descuento || 0);
-        const final = desc > 0 ? Math.max(0, valor - (valor * desc) / 100) : valor;
-        return final;
+        return desc > 0 ? Math.max(0, valor - (valor * desc) / 100) : valor;
     }, []);
 
     const getKey = useCallback((prod) => {
@@ -313,82 +337,80 @@ export const VistaProductos = ({ q = "", idCategoria = null, reloadKey = 0, topb
         return `ID:${id}`;
     }, []);
 
-    const handleAdd = useCallback(
-        (prod) => {
-            try {
-                const raw = localStorage.getItem(CART_KEY);
-                const cart = raw ? JSON.parse(raw) : [];
+    const handleAdd = useCallback((prod) => {
+        try {
+            const raw = localStorage.getItem(CART_KEY);
+            const cart = raw ? JSON.parse(raw) : [];
 
-                const key = getKey(prod);
-                if (!key || key === "ID:" || key === "COD:") return;
+            const key = getKey(prod);
+            if (!key || key === "ID:" || key === "COD:") return;
 
-                const precioFinal = getPrecioFinal(prod);
-                const idx = cart.findIndex((x) => String(x?.cartKey || "") === key);
+            const precioFinal = getPrecioFinal(prod);
+            const idx = cart.findIndex((x) => String(x?.cartKey || "") === key);
 
-                const itemSafe = {
-                    ...prod,
-                    cartKey: key,
-                    categoria_nombre: String(prod?.categoria?.nombre || ""),
-                    presentacion_nombre: String(prod?.presentacion?.nombre || ""),
-                    precio_unitario: precioFinal,
+            const itemSafe = {
+                ...prod,
+                cartKey: key,
+                categoria_nombre: String(prod?.categoria?.nombre || ""),
+                presentacion_nombre: String(prod?.presentacion?.nombre || ""),
+                precio_unitario: precioFinal,
+                // ✅ Persistente (NO blob)
+                urlRemota: String(prod?.urlRemota || "").trim(),
+            };
+
+            if (idx >= 0) {
+                const newQty = Number(cart[idx]?.cantidad || 0) + 1;
+                cart[idx] = {
+                    ...cart[idx],
+                    ...itemSafe,
+                    cantidad: newQty,
+                    subtotal: precioFinal * newQty,
+                    updated_at: new Date().toISOString(),
                 };
-
-                if (idx >= 0) {
-                    const newQty = Number(cart[idx]?.cantidad || 0) + 1;
-                    cart[idx] = {
-                        ...cart[idx],
-                        ...itemSafe,
-                        cantidad: newQty,
-                        subtotal: precioFinal * newQty,
-                        updated_at: new Date().toISOString(),
-                    };
-                } else {
-                    cart.push({
-                        ...itemSafe,
-                        cantidad: 1,
-                        subtotal: precioFinal,
-                        added_at: new Date().toISOString(),
-                    });
-                }
-
-                localStorage.setItem(CART_KEY, JSON.stringify(cart));
-                window.dispatchEvent(new Event("cart_updated"));
-            } catch (e) {
-                console.error("Error guardando carrito:", e);
+            } else {
+                cart.push({
+                    ...itemSafe,
+                    cantidad: 1,
+                    subtotal: precioFinal,
+                    added_at: new Date().toISOString(),
+                });
             }
-        },
-        [getKey, getPrecioFinal]
-    );
+            toast.info('Producto agregado Corectamente');
+
+            localStorage.setItem(CART_KEY, JSON.stringify(cart));
+            window.dispatchEvent(new Event("cart_updated"));
+        } catch (e) {
+            console.error("Error guardando carrito:", e);
+        }
+    }, [getKey, getPrecioFinal]);
+
 
     const cards = useMemo(() => {
         return productosOrdenados.map((p) => (
-            <ProductCard key={p.id} p={p} fallbackImg={FALLBACK_IMG} onAdd={handleAdd} onOpen={handleOpenDetalle} />
+            <ProductCard key={p.id} p={p} fallbackImg={FALLBACK_IMG} onAdd={handleAdd} onOpen={handleOpenDetalle} getImg={getImg} />
         ));
-    }, [productosOrdenados, handleAdd, handleOpenDetalle]);
+    }, [productosOrdenados, handleAdd, handleOpenDetalle, getImg]);
 
     return (
         <>
             <section className="bg-slate-50 py-2 antialiased overflow-x-hidden">
-                <article className="w-[90%] mx-auto flex flex-col gap-6">
-                    <header className="bg-white border border-slate-200 rounded-lg shadow p-4 md:p-6">
+                <article className="w-[90%] mx-auto flex flex-col gap-2">
+                    <header className="bg-white border border-slate-200 rounded-lg shadow p-2 md:p-4 ">
                         <div className="flex flex-col md:flex-row md:items-end md:justify-between gap-4">
-                            <div className="flex flex-col gap-2">
-                                <h2 className="text-slate-800 text-xl md:text-2xl font-semibold">Productos</h2>
-                                <p className="text-sm text-slate-500">Explora productos con filtros y ordenamiento.</p>
+                            <div className=" flex items-center justify-center">
+                                <p className="text-slate-800 text-xl md:text-2xl font-semibold">Productos</p>
+                           
                             </div>
 
                             <div className="flex items-center justify-between md:justify-end gap-3">
-                                <button type="button" onClick={() => { setOpenFilter(true); setOpenSort(false); }} className="px-4 py-2 rounded-lg border border-slate-200 bg-slate-50 hover:bg-white text-slate-800 text-sm font-medium flex items-center gap-2">
-                                    Filtros
-                                </button>
-
+                       
                                 <div className="relative">
                                     <button type="button" onClick={() => { setOpenSort((v) => !v); setOpenFilter(false); }} className="px-4 py-2 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-800 text-sm font-medium flex items-center gap-2">
                                         Ordenar
                                     </button>
 
                                     {openSort && (
-                                        <div className="absolute right-0 mt-2 w-48 rounded-lg bg-white border border-slate-200 shadow z-50 overflow-hidden">
+                                        <div className="absolute right-0  w-48 rounded-lg bg-white border border-slate-200 shadow z-50 overflow-hidden">
                                             {[
                                                 ["popular", "El más popular"],
                                                 ["newest", "Más nuevo"],
@@ -404,9 +426,6 @@ export const VistaProductos = ({ q = "", idCategoria = null, reloadKey = 0, topb
                                     )}
                                 </div>
 
-                                <button type="button" className="px-4 py-2 rounded-lg border hover:text-white text-sm font-medium transition" style={{ borderColor: PRIMARY, color: PRIMARY }} onMouseEnter={(e) => { e.currentTarget.style.background = PRIMARY; }} onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; }}>
-                                    Acción principal
-                                </button>
                             </div>
                         </div>
                     </header>
@@ -414,16 +433,8 @@ export const VistaProductos = ({ q = "", idCategoria = null, reloadKey = 0, topb
                     {cargando && page === 1 && <div className="w-full bg-white border border-slate-200 rounded-lg shadow p-6 text-center text-slate-600">Cargando productos...</div>}
                     {!cargando && error && <div className="w-full bg-white border border-slate-200 rounded-lg shadow p-6 text-center text-red-600">{error}</div>}
 
-                    {!error && (
-                        <>
-                            <div className="w-full flex items-center justify-between text-sm text-slate-600">
-                                <span>
-                                    Total: <b className="text-slate-900">{total.toLocaleString("es-CO")}</b>
-                                </span>
-                                <span>
-                                    Página <b className="text-slate-900">{page}</b> / {totalPages}
-                                </span>
-                            </div>
+                    {!error && (                       <>
+                       
 
                             <section className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-5 w-full min-w-0">
                                 {cards}
@@ -444,54 +455,20 @@ export const VistaProductos = ({ q = "", idCategoria = null, reloadKey = 0, topb
                     )}
                 </article>
 
-                {openFilter && (
-                    <div className="fixed inset-0 z-50">
-                        <div className="absolute inset-0 bg-black/40" onClick={closeAllPopups} />
-                        <form className="absolute inset-0 p-4 flex items-start justify-center overflow-y-auto">
-                            <div className="w-full max-w-2xl bg-white rounded-lg shadow border border-slate-200 overflow-hidden">
-                                <div className="flex items-start justify-between p-4 md:p-5 border-b border-slate-200">
-                                    <h3 className="text-lg font-semibold text-slate-800">Filtros</h3>
-                                    <button type="button" onClick={closeAllPopups} className="p-2 rounded-lg text-slate-500 hover:bg-slate-100 hover:text-slate-900">
-                                        <IoMdClose className="text-xl" />
-                                    </button>
-                                </div>
-
-                                <div className="p-4 md:p-5">
-                                    <div className="border-b border-slate-200 mb-4">
-                                        <div className="flex flex-wrap gap-2">
-                                            <button type="button" onClick={() => setTab("brand")} className={`${tab === "brand" ? "border-b-2" : "text-slate-500"} pb-2 px-2 text-sm font-medium`} style={{ borderColor: tab === "brand" ? PRIMARY : "transparent" }}>
-                                                Brand
-                                            </button>
-                                            <button type="button" onClick={() => setTab("advanced")} className={`${tab === "advanced" ? "border-b-2" : "text-slate-500"} pb-2 px-2 text-sm font-medium`} style={{ borderColor: tab === "advanced" ? PRIMARY : "transparent" }}>
-                                                Advanced Filters
-                                            </button>
-                                        </div>
-                                    </div>
-
-                                    <div className="mt-6 flex flex-col md:flex-row items-center justify-between gap-3 border-t border-slate-200 pt-4">
-                                        <button type="button" onClick={() => closeAllPopups()} className="w-full md:w-auto px-4 py-2 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-800 text-sm font-medium">
-                                            Limpiar
-                                        </button>
-
-                                        <div className="flex items-center gap-2 w-full md:w-auto">
-                                            <button type="button" onClick={closeAllPopups} className="w-full md:w-auto px-4 py-2 rounded-lg border border-slate-200 bg-slate-50 hover:bg-white text-slate-800 text-sm font-medium">
-                                                Cancelar
-                                            </button>
-                                            <button type="button" onClick={closeAllPopups} className="w-full md:w-auto px-4 py-2 rounded-lg text-white text-sm font-medium" style={{ background: PRIMARY }}>
-                                                Aplicar filtros
-                                            </button>
-                                        </div>
-                                    </div>
-                                </div>
-                            </div>
-                        </form>
-                    </div>
-                )}
+           
             </section>
 
             {openDetalle && (
-                <ModalDetalleProducto p={prodSel} onClose={handleCloseDetalle} onAdd={handleAdd} fallbackImg={FALLBACK_IMG} topbarH={topbarH} />
+                <ModalDetalleProducto
+                    p={prodSel}
+                    onClose={handleCloseDetalle}
+                    onAdd={handleAdd}
+                    fallbackImg={FALLBACK_IMG}
+                    topbarH={topbarH}
+                    getImg={getImg}
+                />
             )}
+
         </>
     );
 };

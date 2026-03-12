@@ -11,7 +11,7 @@ import { getCartItems, removeCartItem, clearCart, updateCartQty } from "../utils
 const PRIMARY = "#AB2121";
 
 export const TopBar = forwardRef(function TopBar(
-  { value, onChange, onReload, onSelectCategoria },
+  { value, onChange, onReload, onSelectCategoria, setPagina = () => { }, pagina },
   ref
 ) {
   const [cartOpen, setCartOpen] = useState(false);
@@ -37,6 +37,7 @@ export const TopBar = forwardRef(function TopBar(
   };
 
   useEffect(() => {
+    console.log('VistaProductos ', pagina);
     setCartOpen(false);
     consultaCategorias();
   }, []);
@@ -87,15 +88,24 @@ export const TopBar = forwardRef(function TopBar(
     setCarrito([]);
   }, []);
 
+  const onToggleCartVer = useCallback(() => {
+    setCartOpen((v) => !v);
+    setPagina('Carrito');
+  }, []);
+
+
+
+
+
   return (
     <nav ref={ref} className="bg-[#AB2121] antialiased shadow-md flex items-center flex-col fixed top-0 left-0 w-full z-[299]">
       <div className="w-[90%] px-4 mx-auto 2xl:px-0 py-2 border-b border-gray-100/30">
         <div className="flex items-center justify-between gap-4">
           {/* LEFT */}
-          <div className="flex items-center space-x-8 flex-1">
+          <div className="flex items-center space-x-8 flex-1 ">
             <div className="shrink-0">
               <a href="#">
-                <img className="block w-auto h-12" src={logoBlanco} alt="Logo" />
+                <img className="block w-auto h-12" src={logoBlanco} alt="Logo" onClick={() => setPagina('VistaProductos')} />
               </a>
             </div>
           </div>
@@ -159,7 +169,15 @@ export const TopBar = forwardRef(function TopBar(
                         <div key={key} className="flex gap-5 border-b border-slate-200 pb-5">
                           {/* Imagen */}
                           <div className="w-24 h-24 rounded-lg overflow-hidden border border-slate-200 bg-slate-50 shrink-0">
-                            <img src={it?.img} alt={it?.producto} className="w-full h-full object-cover" />
+                            <img
+                              src={String(it?.urlRemota || it?.img || "").trim() || "data:image/svg+xml;utf8," + encodeURIComponent("<svg xmlns='http://www.w3.org/2000/svg' width='240' height='240'><rect width='100%' height='100%' fill='#f1f5f9'/><text x='50%' y='50%' dominant-baseline='middle' text-anchor='middle' fill='#64748b' font-family='Arial' font-size='16'>Sin imagen</text></svg>")}
+                              alt={it?.producto || "Producto"}
+                              className="w-full h-full object-cover"
+                              loading="lazy"
+                              decoding="async"
+                            />
+
+
                           </div>
 
                           {/* Contenido */}
@@ -229,8 +247,8 @@ export const TopBar = forwardRef(function TopBar(
                       </div>
                     </div>
 
-                    <button type="button" className="w-full py-3 rounded-lg text-white font-semibold transition hover:opacity-95" style={{ background: PRIMARY }}>
-                      Proceed to Checkout
+                    <button type="button" onClick={onToggleCartVer} className="cursor-pointer w-full py-3 rounded-lg text-white font-semibold transition hover:opacity-95" style={{ background: PRIMARY }}>
+                      Ver Carrito
                     </button>
                   </>
                 )}
@@ -239,9 +257,39 @@ export const TopBar = forwardRef(function TopBar(
           </div>
         </div>
       </div>
-
       {/* CATEGORÍAS */}
-      <div className="h-12 flex gap-8 justify-center items-center w-[90%]">
+      {pagina !== 'Carrito' && pagina !== 'FinalizarPedido' ? (
+        <div className="h-12 flex gap-8 justify-center items-center w-[90%]">
+          <div className="flex items-center gap-2">
+            <p
+              onClick={() => {
+                setCategoriaActiva(null);
+                onSelectCategoria(null);
+              }}
+              className={`${categoriaActiva === null ? "font-bold underline text-white" : "text-white hover:underline"} text-lg cursor-pointer transition`}
+              title="Ver todos los productos"
+            >
+              Todos
+            </p>
+          </div>
+
+          {categorias.map((c) => (
+            <p
+              key={c.id}
+              onClick={() => {
+                setCategoriaActiva(c.id);
+                onSelectCategoria(c.id);
+              }}
+              className={`${categoriaActiva === c.id ? "font-bold underline text-white" : "text-white hover:underline"} text-lg cursor-pointer transition`}
+            >
+              {c.nombre}
+            </p>
+          ))}
+        </div>
+      ) : null}
+
+
+      {/* <div className="h-12 flex gap-8 justify-center items-center w-[90%]">
         <div className="flex items-center gap-2">
           <p
             onClick={() => {
@@ -267,7 +315,7 @@ export const TopBar = forwardRef(function TopBar(
             {c.nombre}
           </p>
         ))}
-      </div>
+      </div> */}
     </nav>
   );
 });
